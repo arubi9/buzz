@@ -1,0 +1,2 @@
+FROM ghcr.io/block/buzz:main
+ENTRYPOINT ["/usr/local/bin/buzz-pair-relay"]

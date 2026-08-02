@@ -1,0 +1,23 @@
+# Public NIP-AB pairing sidecar for the membership-protected Buzz relay.
+# Deploy with:
+# flyctl deploy --app buzz-arubi-pairing --config deploy/fly/pairing-relay.toml --remote-only
+
+app = "buzz-arubi-pairing"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile.pairing-relay"
+
+[env]
+  BUZZ_PAIR_RELAY_BIND_ADDR = "0.0.0.0:3000"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
