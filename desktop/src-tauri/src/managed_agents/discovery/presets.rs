@@ -13,6 +13,8 @@ pub(super) struct PresetHarness {
     label: &'static str,
     command: &'static str,
     args: &'static [&'static str],
+    env: &'static [(&'static str, &'static str)],
+    required_commands: &'static [&'static str],
     install_instructions_url: &'static str,
     install_hint: &'static str,
     /// Vendor CLI the ACP command wraps, when the preset is an adapter.
@@ -28,11 +30,20 @@ pub(super) fn preset_catalog_entry(
     def: &PresetHarness,
     resolve: impl Fn(&str) -> Option<PathBuf>,
 ) -> AcpRuntimeCatalogEntry {
+    let dependencies_available = def
+        .required_commands
+        .iter()
+        .all(|command| resolve(command).is_some());
     let (availability, command, binary_path) = match resolve(def.command) {
-        Some(path) => (
-            AcpAvailabilityStatus::Available,
-            Some(def.command.to_string()),
-            Some(path.display().to_string()),
+        Some(path) if dependencies_available => (
+                AcpAvailabilityStatus::Available,
+                Some(def.command.to_string()),
+                Some(path.display().to_string()),
+            ),
+        Some(_) => (
+            AcpAvailabilityStatus::AdapterMissing,
+            None,
+            None,
         ),
         None => {
             let underlying_cli_found = def
@@ -78,7 +89,11 @@ pub(super) fn preset_catalog_entry(
         auth_status: AuthStatus::NotApplicable,
         login_hint: None,
         source: HarnessSource::Preset,
-        definition_env: Default::default(),
+        definition_env: def
+            .env
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect(),
     }
 }
 
@@ -88,6 +103,8 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         label: "Devin",
         command: "devin",
         args: &["acp"],
+        env: &[],
+        required_commands: &[],
         install_instructions_url: "https://docs.devin.ai/cli",
         install_hint: "Buzz talks to Devin through the official Devin CLI's ACP mode (devin acp).",
         underlying_cli: None,
@@ -97,6 +114,8 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         label: "Cursor",
         command: "cursor-agent",
         args: &["acp"],
+        env: &[],
+        required_commands: &[],
         install_instructions_url: "https://cursor.com/downloads",
         install_hint: "Buzz talks to Cursor through the cursor-agent CLI's ACP mode.",
         underlying_cli: None,
@@ -106,6 +125,8 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         label: "Oh My Pi",
         command: "omp",
         args: &["acp"],
+        env: &[],
+        required_commands: &[],
         install_instructions_url: "https://omp.sh/",
         install_hint: "Buzz talks to Oh My Pi through its CLI's ACP mode (omp acp).",
         underlying_cli: None,
@@ -115,6 +136,8 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         label: "Grok Build",
         command: "grok",
         args: &["agent", "--always-approve", "stdio"],
+        env: &[],
+        required_commands: &[],
         install_instructions_url: "https://build.x.ai/docs",
         install_hint: "Buzz talks to Grok Build through its CLI's agent stdio mode.",
         underlying_cli: None,
@@ -124,6 +147,8 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         label: "OpenCode",
         command: "opencode",
         args: &["acp"],
+        env: &[],
+        required_commands: &[],
         install_instructions_url: "https://opencode.ai/docs",
         install_hint: "Buzz talks to OpenCode through its CLI's ACP mode (opencode acp).",
         underlying_cli: None,
@@ -133,6 +158,8 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         label: "Kimi Code",
         command: "kimi",
         args: &["acp"],
+        env: &[],
+        required_commands: &[],
         install_instructions_url: "https://kimi.ai/download",
         install_hint: "Buzz talks to Kimi Code through its CLI's ACP mode (kimi acp).",
         underlying_cli: None,
@@ -142,6 +169,8 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         label: "Amp",
         command: "amp-acp",
         args: &[],
+        env: &[],
+        required_commands: &[],
         install_instructions_url: "https://github.com/tao12345666333/amp-acp",
         install_hint: "Buzz talks to the Amp CLI through the amp-acp adapter. Follow the setup guide to install the adapter so the amp-acp command is on your PATH.",
         underlying_cli: Some("amp"),
@@ -151,6 +180,8 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         label: "Hermes Agent",
         command: "hermes-acp",
         args: &[],
+        env: &[],
+        required_commands: &[],
         install_instructions_url: "https://hermes-agent.nousresearch.com",
         install_hint: "Buzz talks to Hermes Agent through its hermes-acp command.",
         underlying_cli: None,
@@ -160,6 +191,8 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         label: "OpenClaw",
         command: "openclaw",
         args: &["acp"],
+        env: &[],
+        required_commands: &[],
         install_instructions_url: "https://docs.openclaw.ai/start/getting-started",
         install_hint: "Buzz talks to OpenClaw through its ACP mode (openclaw acp), which relies on the OpenClaw Gateway daemon. Follow the setup guide to install both.\n\n\
             ⚠️  Execution-locus note: `openclaw acp` runs tools inside the \
@@ -170,6 +203,21 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
             needs BUZZ_* credentials at execution time, set them on the \
             Gateway's own environment separately.",
         underlying_cli: None,
+    },
+    PresetHarness {
+        id: "ocx",
+        label: "OCX (Claude Code)",
+        command: "claude-agent-acp",
+        args: &[],
+        env: &[
+            ("ANTHROPIC_BASE_URL", "http://127.0.0.1:10100"),
+            ("ANTHROPIC_AUTH_TOKEN", "opencodex-proxy"),
+            ("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "1"),
+        ],
+        required_commands: &["ocx"],
+        install_instructions_url: "https://opencodex.me/guides/claude-code/",
+        install_hint: "Install OCX and the Claude ACP adapter, configure OpenRouter in OCX, then start `ocx service` (or run `ocx start`). Buzz does not manage OCX credentials or its service.",
+        underlying_cli: Some("ocx"),
     },
 ];
 
@@ -184,7 +232,11 @@ pub(crate) fn preset_harness_definitions(
                 label: preset.label.to_string(),
                 command: preset.command.to_string(),
                 args: preset.args.iter().map(|arg| arg.to_string()).collect(),
-                env: Default::default(),
+                env: preset
+                    .env
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                    .collect(),
                 install_instructions_url: preset.install_instructions_url.to_string(),
                 install_hint: preset.install_hint.to_string(),
             },
@@ -213,6 +265,8 @@ mod tests {
         label: "Amp Test",
         command: "amp-acp",
         args: &[],
+        env: &[],
+        required_commands: &[],
         install_instructions_url: "https://example.com/install",
         install_hint: "Install the amp-acp npm adapter.",
         underlying_cli: Some("amp"),
@@ -331,5 +385,74 @@ mod tests {
         assert_eq!(entry.availability, AcpAvailabilityStatus::NotInstalled);
         assert!(!entry.requires_external_cli);
         assert!(entry.underlying_cli_path.is_none());
+    }
+
+    #[test]
+    fn ocx_preset_requires_ocx_and_claude_acp_and_routes_to_the_local_gateway() {
+        let preset = PRESET_HARNESSES
+            .iter()
+            .find(|preset| preset.id == "ocx")
+            .expect("OCX preset should be present");
+
+        let available = preset_catalog_entry(preset, |command| match command {
+            "claude-agent-acp" => Some(PathBuf::from("/usr/local/bin/claude-agent-acp")),
+            "ocx" => Some(PathBuf::from("/usr/local/bin/ocx")),
+            _ => None,
+        });
+        assert_eq!(available.availability, AcpAvailabilityStatus::Available);
+        assert_eq!(available.command.as_deref(), Some("claude-agent-acp"));
+        assert_eq!(
+            available
+                .definition_env
+                .get("ANTHROPIC_BASE_URL")
+                .map(String::as_str),
+            Some("http://127.0.0.1:10100")
+        );
+        assert_eq!(
+            available
+                .definition_env
+                .get("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY")
+                .map(String::as_str),
+            Some("1")
+        );
+
+        let missing_ocx = preset_catalog_entry(preset, |command| {
+            (command == "claude-agent-acp")
+                .then(|| PathBuf::from("/usr/local/bin/claude-agent-acp"))
+        });
+        assert_eq!(
+            missing_ocx.availability,
+            AcpAvailabilityStatus::AdapterMissing
+        );
+        assert!(missing_ocx.command.is_none());
+
+        let missing_adapter = preset_catalog_entry(preset, |command| {
+            (command == "ocx").then(|| PathBuf::from("/usr/local/bin/ocx"))
+        });
+        assert_eq!(
+            missing_adapter.availability,
+            AcpAvailabilityStatus::AdapterMissing
+        );
+        assert!(missing_adapter.command.is_none());
+    }
+
+    #[test]
+    fn ocx_definition_preserves_gateway_environment() {
+        let definition = super::preset_harness_definitions()
+            .into_iter()
+            .find(|definition| definition.id == "ocx")
+            .expect("OCX definition should be present");
+
+        assert_eq!(
+            definition.env.get("ANTHROPIC_BASE_URL").map(String::as_str),
+            Some("http://127.0.0.1:10100")
+        );
+        assert_eq!(
+            definition
+                .env
+                .get("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY")
+                .map(String::as_str),
+            Some("1")
+        );
     }
 }

@@ -148,6 +148,58 @@ fn anthropic_model_normalization_uses_display_names() {
     assert_eq!(models[0].name.as_deref(), Some("Claude Opus 4.6"));
 }
 
+#[tokio::test]
+async fn ocx_model_discovery_uses_its_local_catalog_without_starting_acp() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = vec![0; 4096];
+        let received = socket.read(&mut request).await.unwrap();
+        let request = String::from_utf8_lossy(&request[..received]);
+        assert!(request.starts_with("GET /v1/models?limit=1000&ids=cli HTTP/1.1"));
+        assert!(request.contains("anthropic-version: 2023-06-01"));
+        assert!(request.contains("x-api-key: custom-ocx-token"));
+
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 106\r\n\r\n{\"data\":[{\"id\":\"claude-ocx-openrouter--anthropic--claude-sonnet-4-6\",\"display_name\":\"Claude Sonnet 4.6\"}]}",
+            )
+            .await
+            .unwrap();
+    });
+    let env = BTreeMap::from([
+        (
+            "ANTHROPIC_BASE_URL".to_string(),
+            format!("http://{address}"),
+        ),
+        (
+            "ANTHROPIC_AUTH_TOKEN".to_string(),
+            "custom-ocx-token".to_string(),
+        ),
+        (
+            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY".to_string(),
+            "1".to_string(),
+        ),
+    ]);
+
+    let models = discover_ocx_models(&reqwest::Client::new(), &env, None)
+        .await
+        .unwrap()
+        .expect("OCX should be detected");
+    server.await.unwrap();
+
+    assert_eq!(models.agent_name, "OCX");
+    assert_eq!(models.models.len(), 1);
+    assert_eq!(
+        models.models[0].id,
+        "claude-ocx-openrouter--anthropic--claude-sonnet-4-6"
+    );
+    assert_eq!(models.models[0].name.as_deref(), Some("Claude Sonnet 4.6"));
+}
+
 #[test]
 fn redaction_env_records_value_used_for_request() {
     let env = BTreeMap::from([("OPENAI_COMPAT_API_KEY".to_string(), "   ".to_string())]);

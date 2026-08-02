@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashSet},
+    time::Duration,
+};
 
 use nostr::Keys;
 use serde::Deserialize;
@@ -99,6 +102,11 @@ pub async fn get_agent_models(
     // so a build-provided provider still gets live discovery.
     let effective_provider =
         effective_discovery_provider(saved_provider.as_deref(), provider_env_var, &merged_env);
+    if let Some(models) =
+        discover_ocx_models(&state.http_client, &merged_env, persisted_model.clone()).await?
+    {
+        return Ok(models);
+    }
     if let Some(models) = discover_openrouter_models(
         &state.http_client,
         &effective_provider,
@@ -236,6 +244,9 @@ pub async fn discover_agent_models(
         runtime_meta.and_then(|meta| meta.provider_env_var),
         &merged_env,
     );
+    if let Some(models) = discover_ocx_models(&state.http_client, &merged_env, None).await? {
+        return Ok(models);
+    }
 
     // Buzz shared compute discovery must not depend on the local OpenAI ingress: that
     // client endpoint is started only after a live target is selected.
@@ -561,6 +572,19 @@ fn is_anthropic_provider(provider: Option<&str>) -> bool {
     )
 }
 
+fn is_ocx_gateway(env: &BTreeMap<String, String>) -> bool {
+    if env_or_process_value(env, "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY").as_deref()
+        != Some("1")
+    {
+        return false;
+    }
+
+    env_or_process_value(env, "ANTHROPIC_BASE_URL")
+        .and_then(|base_url| url::Url::parse(&base_url).ok())
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| matches!(host.as_str(), "127.0.0.1" | "::1" | "localhost"))
+}
+
 #[cfg(test)]
 fn anthropic_models_url(env: &BTreeMap<String, String>) -> String {
     let base_url = env_value(env, "ANTHROPIC_BASE_URL")
@@ -595,6 +619,56 @@ fn normalize_anthropic_models(response: AnthropicModelListResponse) -> Vec<Agent
             description: None,
         })
         .collect()
+}
+
+async fn discover_ocx_models(
+    client: &reqwest::Client,
+    env: &BTreeMap<String, String>,
+    selected_model: Option<String>,
+) -> Result<Option<AgentModelsResponse>, String> {
+    if !is_ocx_gateway(env) {
+        return Ok(None);
+    }
+    let Some(auth_token) = env_or_process_value(env, "ANTHROPIC_AUTH_TOKEN") else {
+        return Ok(None);
+    };
+
+    let redaction_env = redaction_env_with_value(env, "ANTHROPIC_AUTH_TOKEN", &auth_token);
+    let url = anthropic_models_url_for_discovery(env);
+    let response = client
+        .get(&url)
+        .header("x-api-key", &auth_token)
+        .header("anthropic-version", "2023-06-01")
+        .query(&[("limit", "1000"), ("ids", "cli")])
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .map_err(|error| format!("OCX model discovery request failed: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        let body = crate::managed_agents::redact_env_values_in(&body, &redaction_env);
+        return Err(format!("OCX model discovery HTTP {status}: {body}"));
+    }
+
+    let models = normalize_anthropic_models(
+        response
+            .json::<AnthropicModelListResponse>()
+            .await
+            .map_err(|error| format!("OCX model discovery response parse failed: {error}"))?,
+    );
+    if models.is_empty() {
+        return Err("OCX model discovery returned no models".to_string());
+    }
+
+    Ok(Some(AgentModelsResponse {
+        agent_name: "OCX".to_string(),
+        agent_version: "gateway".to_string(),
+        models,
+        agent_default_model: None,
+        selected_model,
+        supports_switching: true,
+    }))
 }
 
 async fn fetch_anthropic_model_page(
