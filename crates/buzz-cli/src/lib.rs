@@ -1843,7 +1843,7 @@ async fn run(cli: Cli, private_key_from_argv: bool) -> Result<(), CliError> {
     // malformed config surfaces as check results instead of argument-error
     // exits.
     if let Cmd::Doctor { offline } = cli.command {
-        return commands::doctor::run(&cli, offline).await;
+        return commands::doctor::run(&cli, offline, private_key_from_argv).await;
     }
 
     // Auth: private key is required for all relay operations.

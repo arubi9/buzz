@@ -25,6 +25,7 @@ use serde_json::json;
 
 use crate::client::{normalize_relay_url, BuzzClient};
 use crate::error::CliError;
+use crate::private_key::{self, PrivateKeyInputs};
 
 /// Status of a single doctor check.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -34,6 +35,11 @@ enum Status {
     Warning,
     Error,
     Skipped,
+}
+
+fn identity_from_inputs(inputs: PrivateKeyInputs) -> Result<nostr::Keys, CliError> {
+    let key = private_key::resolve_private_key(inputs)?;
+    nostr::Keys::parse(&key).map_err(|e| CliError::Key(format!("invalid private key: {e}")))
 }
 
 impl Status {
@@ -76,11 +82,7 @@ impl Check {
         }
     }
 
-    fn error(
-        id: &'static str,
-        message: impl Into<String>,
-        remediation: Option<&str>,
-    ) -> Self {
+    fn error(id: &'static str, message: impl Into<String>, remediation: Option<&str>) -> Self {
         Self {
             id,
             status: Status::Error,
@@ -103,7 +105,11 @@ impl Check {
 ///
 /// The doctor never returns `Err` for missing configuration; it reports
 /// the problem as a check and exits non-zero via `run_from_args`.
-pub async fn run(cli: &crate::Cli, offline: bool) -> Result<(), CliError> {
+pub async fn run(
+    cli: &crate::Cli,
+    offline: bool,
+    private_key_from_argv: bool,
+) -> Result<(), CliError> {
     let mut checks: Vec<Check> = Vec::new();
 
     // ---- local checks ----
@@ -121,7 +127,10 @@ pub async fn run(cli: &crate::Cli, offline: bool) -> Result<(), CliError> {
     } else if !(relay_url.starts_with("http://") || relay_url.starts_with("https://")) {
         checks.push(Check::error(
             "relay_url",
-            format!("relay URL {:?} is not an http(s) URL after canonicalization", relay_url),
+            format!(
+                "relay URL {:?} is not an http(s) URL after canonicalization",
+                relay_url
+            ),
             Some("Use http:// or https://; ws:// and wss:// are rewritten automatically"),
         ));
     } else {
@@ -132,33 +141,28 @@ pub async fn run(cli: &crate::Cli, offline: bool) -> Result<(), CliError> {
     }
 
     // identity check: parse the private key. Never echo the material.
-    let keys: Option<nostr::Keys> = match cli.private_key.as_deref() {
-        None => {
+    let keys: Option<nostr::Keys> = match identity_from_inputs(PrivateKeyInputs {
+        private_key: cli.private_key.clone(),
+        private_key_file: cli.private_key_file.clone(),
+        private_key_stdin: cli.private_key_stdin,
+        private_key_from_argv,
+    }) {
+        Ok(k) => {
+            let pk = k.public_key().to_hex();
+            checks.push(Check::ok(
+                "identity",
+                format!("signing identity available: {pk}"),
+            ));
+            Some(k)
+        }
+        Err(e) => {
             checks.push(Check::error(
                 "identity",
-                "BUZZ_PRIVATE_KEY is not set",
-                Some("Set BUZZ_PRIVATE_KEY to a hex or nsec key"),
+                e.to_string(),
+                Some("Provide one private key via BUZZ_PRIVATE_KEY, --private-key-file, or --private-key-stdin"),
             ));
             None
         }
-        Some(raw) => match nostr::Keys::parse(raw) {
-            Ok(k) => {
-                let pk = k.public_key().to_hex();
-                checks.push(Check::ok(
-                    "identity",
-                    format!("signing identity available: {pk}"),
-                ));
-                Some(k)
-            }
-            Err(e) => {
-                checks.push(Check::error(
-                    "identity",
-                    format!("BUZZ_PRIVATE_KEY failed to parse: {e}"),
-                    Some("Provide a nostr private key in hex or nsec form"),
-                ));
-                None
-            }
-        },
     };
 
     // auth_tag check: parse only; never print the tag material.
@@ -179,25 +183,23 @@ pub async fn run(cli: &crate::Cli, offline: bool) -> Result<(), CliError> {
         }
         Some(raw) => match buzz_sdk::nip_oa::parse_auth_tag(raw) {
             Ok(tag) => match &keys {
-                Some(k) => {
-                    match buzz_sdk::nip_oa::verify_auth_tag(raw, &k.public_key()) {
-                        Ok(_) => {
-                            checks.push(Check::ok(
-                                "auth_tag",
-                                "BUZZ_AUTH_TAG parsed and verified for this identity",
-                            ));
-                            Some(tag)
-                        }
-                        Err(e) => {
-                            checks.push(Check::error(
-                                "auth_tag",
-                                format!("BUZZ_AUTH_TAG failed verification: {e}"),
-                                Some("Re-issue the auth tag for the current identity"),
-                            ));
-                            None
-                        }
+                Some(k) => match buzz_sdk::nip_oa::verify_auth_tag(raw, &k.public_key()) {
+                    Ok(_) => {
+                        checks.push(Check::ok(
+                            "auth_tag",
+                            "BUZZ_AUTH_TAG parsed and verified for this identity",
+                        ));
+                        Some(tag)
                     }
-                }
+                    Err(e) => {
+                        checks.push(Check::error(
+                            "auth_tag",
+                            format!("BUZZ_AUTH_TAG failed verification: {e}"),
+                            Some("Re-issue the auth tag for the current identity"),
+                        ));
+                        None
+                    }
+                },
                 None => {
                     // Cannot verify without an identity; report as warning.
                     checks.push(Check::warning(
@@ -227,15 +229,19 @@ pub async fn run(cli: &crate::Cli, offline: bool) -> Result<(), CliError> {
     // ---- remote checks ----
 
     if offline {
-        checks.push(Check::skipped(
-            "relay_reachable",
-            "skipped (--offline)",
-        ));
+        checks.push(Check::skipped("relay_reachable", "skipped (--offline)"));
         checks.push(Check::skipped("nip11", "skipped (--offline)"));
         checks.push(Check::skipped("auth_read", "skipped (--offline)"));
         checks.push(Check::skipped("membership", "skipped (--offline)"));
     } else {
-        run_remote_checks(&relay_url, keys.as_ref(), auth_tag.as_ref(), cli, &mut checks).await;
+        run_remote_checks(
+            &relay_url,
+            keys.as_ref(),
+            auth_tag.as_ref(),
+            cli,
+            &mut checks,
+        )
+        .await;
     }
 
     // ---- output ----
@@ -346,10 +352,7 @@ async fn run_remote_checks(
             });
             match client.query_paginated(filter, 1).await {
                 Ok(events) => {
-                    checks.push(Check::ok(
-                        "auth_read",
-                        "authenticated read succeeded",
-                    ));
+                    checks.push(Check::ok("auth_read", "authenticated read succeeded"));
                     // membership: any kind:39002 with #p=self means we're
                     // a member of at least one channel.
                     if events.is_empty() {
@@ -370,7 +373,11 @@ async fn run_remote_checks(
                 // True auth rejection — either an explicit Auth variant or a
                 // relay 401/403 — classifies as auth (exit 3).
                 Err(e @ CliError::Auth(_))
-                | Err(e @ CliError::Relay { status: 401 | 403, .. }) => {
+                | Err(
+                    e @ CliError::Relay {
+                        status: 401 | 403, ..
+                    },
+                ) => {
                     checks.push(Check::error(
                         "auth_read",
                         format!("relay rejected authentication: {e}"),
@@ -522,15 +529,14 @@ fn emit_and_exit(checks: &[Check]) -> Result<(), CliError> {
             body: format!("doctor check {} failed: {}", c.id, c.message),
         });
     }
-    Err(CliError::Other(
-        "one or more doctor checks failed".into(),
-    ))
+    Err(CliError::Other("one or more doctor checks failed".into()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::exit_code;
+    use std::io::Write;
 
     fn check_with(id: &'static str, status: Status) -> Check {
         Check {
@@ -539,6 +545,18 @@ mod tests {
             message: String::new(),
             remediation: None,
         }
+    }
+
+    #[test]
+    fn identity_accepts_private_key_file() {
+        let mut file = tempfile::NamedTempFile::new().expect("temporary key file");
+        writeln!(file, "{}", "1".repeat(64)).expect("write key");
+
+        assert!(identity_from_inputs(crate::private_key::PrivateKeyInputs {
+            private_key_file: Some(file.path().to_path_buf()),
+            ..Default::default()
+        })
+        .is_ok());
     }
 
     #[test]
