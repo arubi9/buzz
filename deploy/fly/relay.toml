@@ -1,0 +1,55 @@
+# Main Buzz relay for the arubi9 fork. Secrets remain managed in Fly.
+app = "buzz-arubi"
+primary_region = "iad"
+
+[build]
+  dockerfile = "../../Dockerfile"
+
+[env]
+  BUZZ_ALLOW_NIP_OA_AUTH = "true"
+  BUZZ_AUTO_MIGRATE = "true"
+  BUZZ_BIND_ADDR = "0.0.0.0:3000"
+  BUZZ_CORS_ORIGINS = "https://buzz-arubi.fly.dev"
+  BUZZ_DOMAIN = "buzz-arubi.fly.dev"
+  BUZZ_GIT_CONFORMANCE_PROBE = "true"
+  BUZZ_GIT_REPO_PATH = "/data/git"
+  BUZZ_HEALTH_PORT = "8080"
+  BUZZ_MEDIA_BASE_URL = "https://buzz-arubi.fly.dev/media"
+  BUZZ_MEDIA_SERVER_DOMAIN = "buzz-arubi.fly.dev"
+  BUZZ_METRICS_PORT = "9102"
+  BUZZ_REQUIRE_AUTH_TOKEN = "true"
+  BUZZ_REQUIRE_RELAY_MEMBERSHIP = "true"
+  BUZZ_S3_ADDRESSING_STYLE = "virtual"
+  BUZZ_S3_BUCKET = "buzz-arubi-media"
+  BUZZ_S3_ENDPOINT = "https://fly.storage.tigris.dev"
+  BUZZ_S3_REGION = "auto"
+  BUZZ_SERVE_GIT_WEB_GUI = "true"
+  RELAY_OWNER_PUBKEY = "1a97556bcb3f3539a499797ada9c2dd104923ab15bba22cdef2897c706b5645c"
+  RELAY_URL = "wss://buzz-arubi.fly.dev"
+  RUST_LOG = "buzz_relay=info,buzz_db=info,buzz_auth=info,buzz_pubsub=info,tower_http=info"
+
+[[mounts]]
+  source = "buzz_git"
+  destination = "/data/git"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 8080
+
+  [[services.http_checks]]
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "45s"
+    method = "get"
+    path = "/_readiness"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
