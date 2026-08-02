@@ -2,6 +2,7 @@ pub mod agent_management;
 mod client;
 mod commands;
 mod error;
+mod private_key;
 mod validate;
 
 use clap::{Parser, Subcommand};
@@ -37,7 +38,11 @@ where
     // double-install returns Err and is harmless.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let cli = match Cli::try_parse_from(args) {
+    let argv: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+    let private_key_from_argv =
+        private_key::private_key_flag_on_argv(argv.iter().filter_map(|s| s.to_str()));
+
+    let cli = match Cli::try_parse_from(argv) {
         Ok(cli) => cli,
         Err(e) => {
             if e.use_stderr() {
@@ -50,7 +55,7 @@ where
             }
         }
     };
-    match run(cli).await {
+    match run(cli, private_key_from_argv).await {
         Ok(()) => 0,
         Err(e) => {
             error::print_error(&e);
@@ -68,8 +73,12 @@ Buzz CLI — interact with a Buzz relay
 
 Configuration (flags override env vars):
   BUZZ_RELAY_URL     Relay base URL        [default: http://localhost:3000]
-  BUZZ_PRIVATE_KEY   Nostr private key (hex or nsec)  [required]
+  BUZZ_PRIVATE_KEY   Nostr private key (hex or nsec)  [preferred over --private-key]
   BUZZ_AUTH_TAG      NIP-OA auth tag JSON  [optional]
+
+Identity secrets: prefer BUZZ_PRIVATE_KEY, --private-key-file, or
+--private-key-stdin. Passing --private-key on argv is deprecated (shell
+history / process listings).
 
 The 'pack' subcommand runs locally and does not require a relay connection.
 
@@ -81,9 +90,19 @@ struct Cli {
     #[arg(long, env = "BUZZ_RELAY_URL", default_value = "http://localhost:3000")]
     relay: String,
 
-    /// Nostr private key (hex or nsec). This is the CLI's identity.
+    /// Nostr private key (hex or nsec). Prefer `BUZZ_PRIVATE_KEY`,
+    /// `--private-key-file`, or `--private-key-stdin` — passing the secret on
+    /// argv leaks into shell history and `ps` (deprecated).
     #[arg(long, env = "BUZZ_PRIVATE_KEY", hide_env_values = true)]
     private_key: Option<String>,
+
+    /// Read the Nostr private key from a file (mode 0600 recommended).
+    #[arg(long, value_name = "PATH")]
+    private_key_file: Option<std::path::PathBuf>,
+
+    /// Read the Nostr private key from stdin (trim surrounding whitespace).
+    #[arg(long, default_value_t = false)]
+    private_key_stdin: bool,
 
     /// NIP-OA auth tag JSON (owner attestation). Injected into every signed event.
     #[arg(long, env = "BUZZ_AUTH_TAG", hide_env_values = true)]
@@ -236,6 +255,12 @@ enum Cmd {
     /// Community moderation — reports queue, bans, timeouts, audit trail
     #[command(subcommand)]
     Moderation(ModerationCmd),
+    /// Non-mutating preflight diagnostics for the CLI environment and relay
+    Doctor {
+        /// Run only local checks; mark remote checks as skipped
+        #[arg(long, default_value_t = false)]
+        offline: bool,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -1768,7 +1793,42 @@ pub enum ModerationCmd {
     },
 }
 
-async fn run(cli: Cli) -> Result<(), CliError> {
+/// Normalize hand-authored `BUZZ_AUTH_TAG` input to strict JSON.
+///
+/// `.env` files and shell exports sometimes carry the tag in the unquoted
+/// shorthand `[auth,<hex>,<conditions>,<hex>]` (quotes dropped by hand).
+/// When the input is not valid JSON but is bracket-delimited, rewrite it as
+/// a JSON array of the comma-separated fields (an empty field `,,` becomes
+/// `""`, matching the canonical form `["auth","hex","","hex"]`).
+///
+/// This is presentation-layer leniency at the configuration edge only: the
+/// output is always fed through the SDK's strict `parse_auth_tag` /
+/// `verify_auth_tag`, which enforce structure, hex, the conditions grammar,
+/// and the BIP-340 signature. Inputs that are already valid JSON — or not
+/// recognizable as the shorthand — are returned unchanged so the strict
+/// parser reports the error on the original bytes.
+fn normalize_auth_tag_input(input: &str) -> String {
+    let trimmed = input.trim();
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+        return trimmed.to_owned();
+    }
+    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        let fields: Vec<&str> = trimmed[1..trimmed.len() - 1]
+            .split(',')
+            .map(str::trim)
+            .collect();
+        // Only a plausible 4-field auth tag is rewritten; anything else is
+        // passed through untouched for the strict parser to reject with an
+        // error that references the caller's original input.
+        if fields.len() == 4 && !fields.iter().any(|f| f.contains('"')) {
+            // serde_json cannot fail serializing a Vec<&str>.
+            return serde_json::to_string(&fields).expect("string array serializes");
+        }
+    }
+    trimmed.to_owned()
+}
+
+async fn run(cli: Cli, private_key_from_argv: bool) -> Result<(), CliError> {
     let relay_url = client::normalize_relay_url(&cli.relay);
 
     // Pack commands are local-only — no relay connection needed.
@@ -1779,26 +1839,47 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         };
     }
 
+    // Doctor runs its own credential/relay handling so that missing or
+    // malformed config surfaces as check results instead of argument-error
+    // exits.
+    if let Cmd::Doctor { offline } = cli.command {
+        return commands::doctor::run(&cli, offline, private_key_from_argv).await;
+    }
+
     // Auth: private key is required for all relay operations.
     // The keypair IS the identity — no tokens, no other auth.
-    let private_key_str = cli.private_key.ok_or_else(|| {
-        CliError::Auth("BUZZ_PRIVATE_KEY is required (use --private-key or set env var)".into())
+    let private_key_str = private_key::resolve_private_key(private_key::PrivateKeyInputs {
+        private_key: cli.private_key,
+        private_key_file: cli.private_key_file,
+        private_key_stdin: cli.private_key_stdin,
+        private_key_from_argv,
     })?;
     let keys = Keys::parse(&private_key_str)
         .map_err(|e| CliError::Key(format!("invalid BUZZ_PRIVATE_KEY: {e}")))?;
 
     // NIP-OA: parse and verify the auth tag if provided.
+    //
+    // `BUZZ_AUTH_TAG` is hand-authored configuration, so the unquoted raw
+    // shorthand `[auth,hex,,hex]` is normalized to JSON here — at this input
+    // edge only. The SDK grammar and the `x-auth-tag` wire format stay strict
+    // JSON; all validation and signature verification happen on the strict
+    // path below, unchanged.
     let (auth_tag, auth_tag_json) = match cli.auth_tag {
-        Some(ref json) if !json.is_empty() => {
-            let tag = buzz_sdk::nip_oa::parse_auth_tag(json)
+        Some(ref input) if !input.is_empty() => {
+            let json = normalize_auth_tag_input(input);
+            let tag = buzz_sdk::nip_oa::parse_auth_tag(&json)
                 .map_err(|e| CliError::Auth(format!("BUZZ_AUTH_TAG is malformed: {e}")))?;
-            buzz_sdk::nip_oa::verify_auth_tag(json, &keys.public_key()).map_err(|e| {
+            buzz_sdk::nip_oa::verify_auth_tag(&json, &keys.public_key()).map_err(|e| {
                 CliError::Auth(format!(
                     "BUZZ_AUTH_TAG verification failed for pubkey {}: {e}",
                     keys.public_key().to_hex()
                 ))
             })?;
-            (Some(tag), Some(json.clone()))
+            // Canonical wire form derives from the parsed-and-verified tag
+            // (same shape as buzz-acp's RestClient), never from raw input.
+            let canonical = serde_json::to_string(tag.as_slice())
+                .map_err(|e| CliError::Auth(format!("BUZZ_AUTH_TAG serialization failed: {e}")))?;
+            (Some(tag), Some(canonical))
         }
         _ => (None, None),
     };
@@ -1827,6 +1908,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Mem(sub) => commands::mem::dispatch(sub, &client).await,
         Cmd::Moderation(sub) => commands::moderation::dispatch(sub, &client, &cli.format).await,
         Cmd::Pack(_) => unreachable!("handled above"),
+        Cmd::Doctor { .. } => unreachable!("handled above"),
     }
 }
 
@@ -1834,6 +1916,51 @@ async fn run(cli: Cli) -> Result<(), CliError> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// Raw shorthand `[auth,hex,,hex]` normalizes to strict JSON; the empty
+    /// conditions field becomes `""`.
+    #[test]
+    fn normalize_auth_tag_raw_shorthand() {
+        let owner = "a".repeat(64);
+        let sig = "b".repeat(128);
+
+        let raw = format!("[auth,{owner},,{sig}]");
+        let json = normalize_auth_tag_input(&raw);
+        let parsed: Vec<String> = serde_json::from_str(&json).expect("output must be JSON");
+        assert_eq!(parsed, vec!["auth", &owner, "", &sig]);
+
+        // With conditions and surrounding whitespace (shell/.env artifacts).
+        let raw = format!("  [auth, {owner} , kind=9, {sig}]  \n");
+        let json = normalize_auth_tag_input(&raw);
+        let parsed: Vec<String> = serde_json::from_str(&json).expect("output must be JSON");
+        assert_eq!(parsed, vec!["auth", &owner, "kind=9", &sig]);
+    }
+
+    /// Valid JSON input passes through byte-identical (modulo outer trim) —
+    /// the normalizer must never rewrite well-formed input.
+    #[test]
+    fn normalize_auth_tag_json_passthrough() {
+        let owner = "a".repeat(64);
+        let sig = "b".repeat(128);
+        let json_in = serde_json::json!(["auth", owner, "kind=9", sig]).to_string();
+        assert_eq!(normalize_auth_tag_input(&json_in), json_in);
+    }
+
+    /// Inputs that are neither JSON nor a plausible 4-field shorthand pass
+    /// through unchanged, so the strict parser rejects the original bytes.
+    #[test]
+    fn normalize_auth_tag_leaves_garbage_untouched() {
+        for garbage in [
+            "not a tag",
+            "[auth,too,few]",
+            "[a,b,c,d,e]",
+            r#"[auth,"quoted",x,y]"#, // quote chars => not the shorthand
+            "[]",
+            "{\"auth\":1}",
+        ] {
+            assert_eq!(normalize_auth_tag_input(garbage), garbage.trim());
+        }
+    }
 
     /// Smoke test: CLI definition is valid and parseable.
     #[test]
@@ -1872,6 +1999,7 @@ mod tests {
             "canvas",
             "channels",
             "dms",
+            "doctor",
             "emoji",
             "feed",
             "issues",

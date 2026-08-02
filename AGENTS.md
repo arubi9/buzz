@@ -145,6 +145,10 @@ first, then implement handling in the relay.
 
 **Channel scoping**: Channels use `h` tags (NIP-29 group tag), not `e` tags.
 Filters and queries must scope to `h` tags when operating within a channel.
+This applies to events *inside* a channel. Addressable events that describe a
+channel carry its id in their `d` tag instead: kind:39000 (metadata),
+kind:39001, kind:39002 (membership). `get_channels` resolves a user's channels
+from the `d` tag of their kind:39002 events, not from `h`.
 
 **Agent-facing operations go in `buzz-cli`**: New agent-facing features belong in `buzz-cli` — add a subcommand there first, then wire the REST/WebSocket call in `client.rs`. `buzz-dev-mcp` (shell + file tools for `buzz-agent`) is separate.
 
@@ -164,6 +168,8 @@ check existing reply handlers for the pattern.
 (`BUZZ_RELAY_URL`, `BUZZ_PRIVATE_KEY`, `BUZZ_AUTH_TAG`) are auto-injected
 by the ACP harness into managed agent subprocesses. In development, set
 `BUZZ_PRIVATE_KEY` and `BUZZ_RELAY_URL` in your environment manually.
+Prefer `--private-key-file` / `--private-key-stdin` over `--private-key` on
+argv (shell history / `ps` leak — #4032).
 
 ### Building the CLI
 
